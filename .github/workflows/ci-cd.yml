@@ -1,0 +1,217 @@
+name: CI/CD - HelpCare API
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # Permite relanzar el pipeline a mano desde la pestaña Actions.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, auditoría, pruebas y SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v7
+        with:
+          # SonarCloud necesita el historial completo para atribuir cambios.
+          fetch-depth: 0
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Ejecutar linter
+        run: npm run lint
+
+      - name: Auditar dependencias de producción (vulnerabilidades altas o críticas)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Pruebas con cobertura (almacén en memoria, mínimo 80%)
+        run: npm test -- --ci --coverageReporters=text --coverageReporters=text-summary --coverageReporters=lcov
+
+      - name: Publicar reporte de cobertura
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage/
+
+      # Solo corre si el repositorio tiene el secreto SONAR_TOKEN configurado.
+      # La organización y la clave del proyecto se deducen del propio
+      # repositorio (así las asigna SonarCloud al importar desde GitHub); si
+      # las suyas son distintas, defínelas en las variables SONAR_ORGANIZATION
+      # y SONAR_PROJECT_KEY del repositorio.
+      - name: Identificar el proyecto en SonarCloud
+        if: env.SONAR_TOKEN != ''
+        env:
+          SONAR_ORGANIZATION: ${{ vars.SONAR_ORGANIZATION }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+        run: |
+          DUENO="$GITHUB_REPOSITORY_OWNER"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          echo "SONAR_ORG=${SONAR_ORGANIZATION:-${DUENO,,}}" >> "$GITHUB_ENV"
+          echo "SONAR_KEY=${SONAR_PROJECT_KEY:-${DUENO}_${REPO}}" >> "$GITHUB_ENV"
+
+      - name: Análisis de calidad con SonarCloud
+        if: env.SONAR_TOKEN != ''
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.organization=${{ env.SONAR_ORG }}
+            -Dsonar.projectKey=${{ env.SONAR_KEY }}
+
+  test-postgres:
+    name: Pruebas contra PostgreSQL
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: helpcare
+          POSTGRES_PASSWORD: helpcare
+          POSTGRES_DB: helpcare
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U helpcare"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://helpcare:helpcare@localhost:5432/helpcare
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v7
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: '.node-version'
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      # Las mismas pruebas, ahora contra la base real (en serie, comparten la base).
+      - name: Pruebas con cobertura contra PostgreSQL
+        run: npm run test:pg -- --ci --coverageReporters=text-summary
+
+  build:
+    name: Construcción y prueba de la imagen Docker
+    needs: [test, test-postgres]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clonar repositorio
+        uses: actions/checkout@v7
+
+      - name: Construir imagen
+        run: docker build -t helpcare-api:${{ github.sha }} .
+
+      # La imagen corre con NODE_ENV=production: sin un JWT_SECRET de 32+
+      # caracteres se niega a arrancar, y eso también se comprueba aquí.
+      - name: Verificar que la imagen se niega a arrancar sin JWT_SECRET
+        run: |
+          if docker run --rm helpcare-api:${{ github.sha }}; then
+            echo "::error::La imagen arrancó sin JWT_SECRET"
+            exit 1
+          fi
+          echo "Correcto: la imagen exige JWT_SECRET"
+
+      - name: Verificar que el contenedor arranca y responde en /health y /ready
+        run: |
+          docker run -d --name helpcare-smoke -p 3000:3000 \
+            -e JWT_SECRET=solo_para_la_prueba_de_humo_en_ci_0123456789 \
+            helpcare-api:${{ github.sha }}
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:3000/health && curl -fsS http://localhost:3000/ready; then
+              echo ""
+              echo "El contenedor responde correctamente"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::El contenedor no respondió"
+          docker logs helpcare-smoke
+          exit 1
+
+  deploy:
+    name: Despliegue automático a entorno de prueba (Render)
+    needs: [test, test-postgres, build]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: test
+    concurrency:
+      group: deploy-test
+      cancel-in-progress: false
+    steps:
+      # Mientras el servicio de Render no exista (primer push del repositorio),
+      # el despliegue se omite con un aviso en lugar de marcar error.
+      - name: Comprobar la configuración de Render
+        id: config
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          RENDER_SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: |
+          if [ -z "$RENDER_DEPLOY_HOOK" ] || [ -z "$RENDER_SERVICE_URL" ]; then
+            echo "::warning::Despliegue omitido: faltan el secreto RENDER_DEPLOY_HOOK o la variable RENDER_SERVICE_URL (Settings > Secrets and variables > Actions)"
+            echo "configurado=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configurado=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # El Deploy Hook es una URL privada de Render que, al recibir un POST,
+      # lanza un despliegue del último commit de main. Se guarda como secreto
+      # del repositorio para no exponerla en el código.
+      - name: Disparar el despliegue en Render (Deploy Hook)
+        if: steps.config.outputs.configurado == 'true'
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK"
+          echo ""
+          echo "Render aceptó la solicitud de despliegue del commit $GITHUB_SHA"
+
+      # Render expone el commit desplegado en RENDER_GIT_COMMIT y la app lo
+      # devuelve en /health; así se comprueba que ya corre la versión nueva.
+      - name: Esperar a que Render sirva la nueva versión (/health)
+        if: steps.config.outputs.configurado == 'true'
+        env:
+          RENDER_SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: |
+          URL="${RENDER_SERVICE_URL%/}/health"
+          echo "Esperando a que $URL responda con el commit $GITHUB_SHA"
+          for i in $(seq 1 60); do
+            BODY=$(curl -s --max-time 60 "$URL" || true)
+            echo "[intento $i] $BODY"
+            case "$BODY" in
+              *"\"commit\":\"$GITHUB_SHA\""*)
+                echo "Despliegue verificado: el entorno de prueba ya sirve el commit $GITHUB_SHA"
+                exit 0
+                ;;
+            esac
+            sleep 15
+          done
+          echo "::error::Render no llegó a servir el commit $GITHUB_SHA a tiempo"
+          exit 1
+
+      - name: Verificar que la base de datos responde (/ready)
+        if: steps.config.outputs.configurado == 'true'
+        env:
+          RENDER_SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+        run: curl -fsS "${RENDER_SERVICE_URL%/}/ready"
